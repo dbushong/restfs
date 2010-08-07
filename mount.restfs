@@ -1,0 +1,479 @@
+#!/usr/bin/perl
+
+## Standard Modules
+use strict;
+use warnings;
+use Getopt::Std;
+use File::Basename;
+use POSIX qw(:errno_h :fcntl_h ceil);
+use Encode;
+use List::Util 'first';
+use Digest::MD5 'md5_base64';
+use Cwd 'abs_path';
+use threads;
+use threads::shared;
+
+## Required Modules
+use Fuse;
+use LWP::UserAgent;
+use URI;
+
+## Optional Modules
+my $grok_css   = eval { require CSS        };
+my $grok_json  = eval { require JSON       };
+my $grok_yaml  = eval { require YAML       };
+my $grok_xpath = eval { require XML::XPath };
+my $grok_html  = $grok_xpath 
+              && eval { require HTML::TreeBuilder };
+
+## Setup and Options
+my $prog = basename($0);
+my %opt;
+getopts('hd', \%opt);
+usage() if $opt{h} || @ARGV != 1;
+sub usage {
+  die <<EOU;
+usage: $prog [-d] mount-point
+       -d: daemonize; default is to run in foreground with debugging
+EOU
+}
+
+## Daemonizing
+if ($opt{d}) {
+  close(STDOUT);
+  close(STDIN);
+  close(STDERR);
+  fork and exit;
+}
+
+## Global var initialization
+my $JSON = JSON->new->allow_nonref(1);
+my $ua = LWP::UserAgent->new(agent => 'Firefox'); # TODO: add sexy useragent
+my %hcache :shared; # TODO: replace with Tie::Cache::LRU or equiv.
+my %ocache; # TODO: replace with Tie::Cache::LRU or equiv.
+my $mount = $ARGV[0]; $mount =~ s,/+$,,;
+$mount = abs_path($mount) unless $mount =~ /^\//;
+die "No such directory $mount\n" unless -d $mount;
+
+## Extensible handler configuration
+my %handlers = (
+  # links handlers take content and return a hash of name => links
+  # names must (obviously) be unique, and links may be relative strings
+  links => {
+    qr{^text/plain$}i => \&find_text_links,
+    qr{html$}i        => \&find_html_links,
+    qr{/css$}i        => \&find_css_links,
+  },
+  # tree handlers take content and path parts and return a valid info hashref
+  # or undef
+  tree => {
+    qr{/(javascript|(x-)?json)$}i => $grok_json  && \&build_json_tree,
+    qr{xml$}i                     => $grok_xpath && \&build_xml_tree,
+    qr{html$}i                    => $grok_html  && \&build_html_tree,
+    qr{/(x-)?yaml$}i              => $grok_yaml  && \&build_yaml_tree,
+    qr{/css$}i                    => 0 && $grok_css   && \&build_css_tree,
+  },
+);
+
+## Run filesystem
+Fuse::main(
+  mountpoint   => $mount,
+  debug        => 0,
+  threaded     => 1,
+  mountopts    => 'allow_other',
+  'getattr'    => 'main::rfs_getattr',
+  'readlink'   => 'main::rfs_readlink',
+  'getdir'     => 'main::rfs_getdir',
+  'open'       => 'main::rfs_open',
+  'read'       => 'main::rfs_read',
+);
+
+exit; # never reached?
+
+## Filesystem calbacks
+sub rfs_getattr {
+  my $info     = parse_path(@_) || return -ENOENT();
+  my $mtime    = $info->{mtime} || time();
+  my $contents = file_contents($info);
+  my $size     = defined($contents) ? length($contents) : 0;
+  my $blksize  = 1024 * 1024;
+  my $blocks   = ceil($size / $blksize);
+  my $type;
+  if ($info->{dir}) {
+    $type = 0040; 
+  }
+  elsif ($info->{link_to}) {
+    $type = 0120;
+  }
+  elsif (defined $contents) {
+    $type = 0100;
+  }
+  else {
+    warn "unknown reponse from parse_path()\n";
+    return -ENOENT();
+  }
+  my $mode = 0444 + ($type << 9); # world-readable + type of file
+  (0, 0, $mode, 1, 0, 0, 0, $size, time(), $mtime, $mtime, $blksize, $blocks);
+}
+
+sub rfs_readlink {
+  my $info = parse_path(@_);
+  $info && $info->{link_to};
+}
+
+sub rfs_getdir {
+  my $info = parse_path(@_) || return -ENOENT();
+  return -ENOTDIR() unless $info->{dir};
+  ('.', '..', map { encode_name($_) } @{$info->{dir}}, 0);
+}
+
+sub rfs_open {
+  my ($path, $flags) = @_;
+  my $info = parse_path($path, 1);
+  # TODO: check flags
+  return 0 if $info && !$info->{dir};
+  return -EACCES();
+}
+
+sub rfs_read {
+  my ($path, $bytes, $off) = @_;
+  my $info     = parse_path($path)    || return -ENOENT();
+  my $contents = file_contents($info) || return -ENOENT();
+  substr($contents, $off, $bytes);
+}
+
+## Utility functions
+sub file_contents {
+  my ($info) = @_;
+  my $file = $info->{file};
+  return undef unless defined $file;
+  Encode::is_utf8($file) ? encode('utf-8', $file) : $file;
+}
+
+sub parse_path {
+  my ($path, $open) = @_;
+  $path =~ s{(?<=[^/])/+$}{}; # trim off trailing /s
+
+  # top level dir: show our cached urls shortened (handy)
+  return { dir => [map { s,^http://,,; $_ } keys %hcache] } 
+    if $path eq '/';
+
+  # skip system .file queries
+  return undef if $path =~ m{^/\.};
+
+  # turn /foo/ba,r/baz -> ('foo', 'ba/r', 'baz')
+  my @parts = map { decode_name($_) } split(/\//, substr($path, 1));
+
+  # decode url and normalize
+  my $url = shift(@parts);
+  $url = "http://$url" unless $url =~ m{^[a-z]+:};
+
+  # next component is optional cmd
+  my $cmd = shift(@parts) || '';
+
+  # perform fetch and set vars
+  my $res     = fetch_cached($url, $open && $cmd eq 'content');
+  my $mtime   = $res->last_modified || time();
+  my $content = $res->decoded_content;
+  my $type    = $res->header('Content-type'); $type =~ s/\s*;.*//;
+
+  if (!$cmd) {
+    my @kids = qw(headers content url);  # shared virtual files/dirs
+    push(@kids, 'links') if handler_for('links', $type);
+    push(@kids, 'tree')  if handler_for('tree',  $type);
+    return { dir => \@kids, mtime => $mtime };
+  }
+  elsif ($cmd eq 'content') {
+    return { file => $content, mtime => $mtime };
+  }
+  elsif ($cmd eq 'url') {
+    return { file => "$url\n", mtime => $mtime };
+  }
+  elsif ($cmd eq 'headers') {
+    my $which = shift(@parts);
+    if (defined $which) {
+      my $hdr  = $res->header($which);
+      return undef unless defined $hdr;
+      my $info = file_or_link_to($hdr);
+      $info->{mtime} = $mtime;
+      return $info;
+    }
+    else {
+      return { dir => [ $res->header_field_names ], mtime => $mtime };
+    }
+  }
+  elsif ($cmd eq 'links') {
+    my $which   = shift(@parts);
+    my $handler = handler_for('links', $type) || return undef;
+    my @links   = $handler->($content);
+
+    # turn ([ foo => bar ], [ foo => baz ], [ quux => garply ])
+    # into ( foo => bar, foo2 => baz, quux => garply )
+    my %links;
+    for (@links) {
+      my ($name, $link) = @$_;
+      my ($base, $n);
+      for ($base = $name, $n = 2; exists $links{$name}; $name = $base.($n++)) {}
+      $links{$name} = $link;
+    }
+    undef @links;
+
+    if (defined $which) {
+      my $lto = link_to($links{$which}, $url) || return undef;
+      return { link_to => $lto, mtime => $mtime };
+    }
+    else {
+      return { 
+        dir   => [ grep { link_to($links{$_}, $url) } keys %links ], 
+        mtime => $mtime 
+      };
+    }
+  }
+  elsif ($cmd eq 'tree') {
+    my $handler    = handler_for('tree', $type) || return undef;
+    my $info       = $handler->($content, $url, @parts) || return undef;
+    $info->{mtime} = $mtime;
+    return $info;
+  }
+}
+
+sub decode_name {
+  my ($str) = @_;
+  $str =~ s#,#/#g;
+  $str =~ s/\%2C/,/ig;
+  $str;
+}
+
+sub encode_name {
+  my ($url) = @_;
+  $url =~ s/,/\%2C/g;
+  $url =~ s#/#,#g;
+  $url;
+}
+
+sub fetch_cached {
+  my ($url, $force) = @_;
+
+  my $res;
+  {
+    lock(%hcache); # TODO finer-grained locking
+    unless ($force) {
+      my $msg = $hcache{$url};
+      $res = HTTP::Response->parse($msg) if $msg;
+    }
+    unless ($res) {
+      print "GET $url\n" unless $opt{d};
+      $res = $ua->get($url);
+      $hcache{$url} = $res->as_string;
+    }
+  }
+  $res;
+}
+
+sub link_to {
+  my ($str, $base) = @_;
+  $str = URI->new_abs($str, $base) if $base;
+  return undef unless $str =~ m{^https?://\S+$};
+  return $mount . '/' . encode_name($str);
+}
+
+sub file_or_link_to {
+  my ($str, $base) = @_;
+  my $lto = link_to($str, $base);
+  return { link_to => $lto } if $lto;
+  return { file    => "$str\n" };
+}
+
+sub parse_css {
+  my ($css) = @_;
+  ocache($css, sub { 
+    my $obj = new CSS;
+    $obj->read_string($_[0]);
+    $obj;
+  });
+}
+
+sub parse_xml {
+  my ($xml) = @_;
+  ocache($xml, sub { XML::XPath->new(xml => $_[0]) });
+}
+
+sub html2xml {
+  my ($html) = @_;
+  ocache($html, sub { HTML::TreeBuilder->new_from_content($_[0])->as_XML });
+}
+
+sub ocache {
+  my ($content, $gen) = @_;
+  $ocache{md5_base64(encode('utf-8', $content))} ||= eval { $gen->($content) };
+}
+
+sub handler_for {
+  my ($thing, $type) = @_;
+  my $key = (first { $type =~ $_ } keys(%{$handlers{$thing}})) || return undef;
+  $handlers{$thing}{$key};
+}
+
+## Handler implementations
+sub find_text_links {
+  my ($content) = @_;
+  return map { [ URI->new($_)->host => $_ ] }
+    sort ($content =~ m{\bhttp://[^\s"'<>]+}g);
+}
+
+sub find_html_links {
+  my ($html) = @_;
+
+  my @links;
+
+  # good xpathy version
+  if ($grok_html) {
+    my $obj = parse_xml(html2xml($html));
+    @links = map {
+      my $name = $_->string_value;
+      $name =~ s/^\s+|\s+$//g;
+      $name = 'untitled' unless length $name;
+      [ $name => scalar($_->getAttribute('href')) ];
+    } eval { $obj->findnodes('//a[@href]') };
+  }
+  # failover regexpy version
+  else {
+    while ($html =~ /<a [^>]*\bhref=["']?([^"'>]+)[^>]*>([^<]+)/g) {
+      my ($href, $name) = ($1, $2);
+      $name =~ s/^\s+|\s+$//g;
+      push(@links, [ $name => $href ]) if length $name && $href;
+    }
+  }
+
+  @links;
+}
+
+sub build_html_tree {
+  my ($html, $url, @parts) = @_;
+  build_xml_tree(html2xml($html), $url, @parts);
+}
+
+sub find_css_links {
+  my ($css) = @_;
+  return () unless $css =~ /url\(/;
+
+  my @links;
+  if ($grok_css) {
+    my $obj = parse_css($css);
+    for my $style (@{$obj->{styles}}) {
+      for my $prop (@{$style->{properties}}) {
+        for my $val (@{$prop->{'values'}}) {
+          $val->{value} =~ /url\((.+)\)/ || next;
+          my $url = $1;
+          for my $sel (map { $_->{name} } @{$style->{selectors}}) {
+            $sel =~ s,/\*.*\*/,,g;
+            $sel =~ s/^\s+|\s+$//g;
+            push(@links, [ $sel => $url ]);
+          }
+        }
+      }
+    }
+  }
+  else {
+    @links = map { [ url => $1 ] } ($css =~ /url\((.+)\)/g);
+  }
+
+  # common cleanup
+  for (@links) {
+    $_->[1] =~ s/^(['"])(.+)\1$/$2/;
+    $_->[1] =~ s/\\\\/\\/g;
+    $_->[1] =~ s/\\([(),\s'"])/$1/g;
+  }
+
+  @links;
+}
+
+sub build_css_tree {
+  my ($css, $url, @parts) = @_;
+}
+
+sub build_json_tree {
+  my ($json, $url, @parts) = @_;
+  my $obj = ocache($json, sub { JSON::from_json($_[0]) }) || return undef;
+  build_obj_tree($obj, $url, sub {
+    my $str = $JSON->encode($_[0]);
+    $str =~ s/^"|"$//g;
+    $str;
+  }, @parts);
+}
+
+sub build_yaml_tree {
+  my ($yaml, $url, @parts) = @_;
+  my $obj = ocache($yaml, sub { YAML::Load($_[0]) }) || return undef;
+  build_obj_tree($obj, $url, undef, @parts);
+}
+
+sub build_obj_tree {
+  my ($obj, $url, $output, @parts) = @_;
+  $output ||= sub { $_[0] };
+
+  for (@parts) {
+    if (ref($obj) eq 'HASH') {
+      $obj = $obj->{$_};
+    }
+    elsif (ref($obj) eq 'ARRAY') {
+      $obj = $obj->[$_];
+    }
+    else {
+      return undef;
+    }
+  }
+  if (ref($obj) eq 'HASH') {
+    return { dir => [ keys %$obj ] };
+  }
+  elsif (ref($obj) eq 'ARRAY') {
+    return { dir => [ 0..$#$obj ] };
+  }
+  else {
+    return file_or_link_to($output->($obj));
+  }
+}
+
+sub build_xml_tree {
+  my ($xml, $url, @parts) = @_;
+
+  my $path = '/' . join('/', @parts);
+  my $xp = parse_xml($xml) || return undef;
+  my $ns = eval { $xp->find($path) };
+  return undef unless $ns && $ns->size;
+  my $node = $ns->get_node(1);
+  if ($node->isa('XML::XPath::Node::Element')) {
+    my (%kids, %count);
+    for my $kid ($node->getChildNodes()) {
+      if (my $name = $kid->getName) {
+        if ($count{$name}++) {
+          if ($count{$name} == 2) {
+            $kids{$name.'[1]'} = 1;
+            delete $kids{$name};
+          }
+          $kids{$name.'['.$count{$name}.']'} = 1;
+        }
+        else {
+          $kids{$name} = 1;
+        }
+      }
+      else {
+        $kids{'text()'} = 1;
+      }
+    }
+    return { dir => [
+      keys(%kids),
+      map { '@' . $_->getName } $node->getAttributes()
+    ]};
+  }
+  elsif ($node->isa('XML::XPath::Node::Attribute')) {
+    return file_or_link_to($node->getNodeValue,
+      ($node->getName =~ /^(href|src)$/i) && $url);
+  }
+  elsif ($node->isa('XML::XPath::Node::Text')) {
+    return file_or_link_to($node->getValue);
+  }
+  else {
+    return undef;
+  }
+}
