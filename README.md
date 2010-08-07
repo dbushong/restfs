@@ -31,7 +31,7 @@ Examples
 
     % mkdir ~/r
     % mount.restfs -d ~/r
-    % cat '/r/bushong.net,dave,tmp,demo.html/links/Google REST Search/tree/responseData/results/0/unescapedUrl/links/RSS/tree/rss/channel/item[1]/title/text()'
+    % cat "$HOME/r/bushong.net,dave,tmp,demo.html/links/Google REST Search/tree/responseData/results/0/unescapedUrl/links/RSS/tree/rss/channel/item[1]/title/text()"
     Blog reveals Afghanistan medic Karen Woo's dedication - BBC News
     % fusermount -u ~/r
 
