@@ -22,7 +22,7 @@ OPTIONAL modules:
 Setup
 -----
 
-    # usermod -G fuse <your username>
+    # usermod -a -G fuse <your username>
     # vi /etc/fuse.conf
     (enable the user_allow_other option, if you desire)
 
