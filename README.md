@@ -54,8 +54,8 @@ Specification
 -------------
 
 Assuming mount on `/mnt`, paths look like: `/mnt/<encoded url>/<info>`
-where <encoded url> is a url with commas replaced with `%2C` then /s replaced 
-with commas.
+where `<encoded url>` is a url with commas replaced with `%2C` then `/`s
+replaced with commas.
 
 So, e.g. `/mnt/en.wikipedia.org,w,api.php?action=parse&page=Kittens`
 
