@@ -62,7 +62,7 @@ So, e.g. `/mnt/en.wikipedia.org,w,api.php?action=parse&page=Kittens`
 (shell escaping is left as an exercise to the reader)
 (you can leave off the `http:,,` if it's not HTTPS)
 
-<info> consists of the following shared files:
+`<info>` consists of the following shared files:
 
 * `content`: result of the request
 * `url`: decoded url of the request for convenience
@@ -74,11 +74,11 @@ additionally, types text/plain and text/html have:
 
 additionally, types text/html, text/xml, and application/json have:
 
-* `tree/`<tree-path>
+* `tree/<tree-path>`
 
-<tree-path> varies depending on the encoding, but for JSON each path
+`<tree-path>` varies depending on the encoding, but for JSON each path
 component corresponds to an object property (numbers for array indices),
-and for html & xml it corresponds to an XPath
+and for html &amp; xml it corresponds to an XPath
 
 Right now the only way to unmount is "fusermount -u /path/to/mntpt" which
 will also make the script exit; ^C or killing the pid won't unmount the fs!
